@@ -1,0 +1,14 @@
+﻿{
+  "name": "codex-cli-usage-visualizer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Visual dashboard for Codex CLI usage and agent activity",
+  "scripts": {
+    "dashboard": "node scripts/codex-usage-dashboard.mjs --serve",
+    "build": "node scripts/codex-usage-dashboard.mjs --output codex-usage-dashboard.html",
+    "metrics": "node scripts/codex-usage-dashboard.mjs --json"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
