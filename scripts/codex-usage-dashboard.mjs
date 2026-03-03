@@ -118,6 +118,14 @@ function parseDate(value) {
   return parsed
 }
 
+function parseUnixSeconds(value) {
+  const seconds = Number(value)
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return null
+  }
+  return new Date(seconds * 1000)
+}
+
 function formatDay(value) {
   const year = value.getFullYear()
   const month = String(value.getMonth() + 1).padStart(2, '0')
@@ -140,7 +148,22 @@ function formatCompact(value) {
 }
 
 function formatPercent(value) {
+  if (value == null || !Number.isFinite(value)) {
+    return '-'
+  }
   return `${value.toFixed(1)}%`
+}
+
+function formatDateTime(value) {
+  const parsed = parseDate(value)
+  return parsed ? parsed.toLocaleString() : '-'
+}
+
+function clamp(value, min, max) {
+  if (!Number.isFinite(value)) {
+    return null
+  }
+  return Math.min(max, Math.max(min, value))
 }
 
 function collectSessionFiles(rootDir) {
@@ -173,6 +196,7 @@ function createEmptySession(filePath) {
     filePath,
     sessionId: path.basename(filePath, '.jsonl'),
     cwd: '',
+    cliVersion: '',
     modelProvider: '',
     model: 'Unknown',
     startedAt: null,
@@ -189,6 +213,9 @@ function createEmptySession(filePath) {
     agentMessages: 0,
     reasoningEvents: 0,
     phaseCounts: {},
+    latestRateLimits: null,
+    latestRateLimitsAt: null,
+    agentLogs: [],
   }
 }
 
@@ -197,6 +224,39 @@ function incrementCount(container, key, amount = 1) {
     container[key] = 0
   }
   container[key] += amount
+}
+
+function extractAssistantText(content) {
+  if (!Array.isArray(content)) {
+    return ''
+  }
+
+  const chunks = []
+  for (const item of content) {
+    if (!item || typeof item !== 'object') {
+      continue
+    }
+
+    if ((item.type === 'output_text' || item.type === 'input_text') && typeof item.text === 'string') {
+      chunks.push(item.text)
+    }
+  }
+
+  return chunks.join('\n').trim()
+}
+
+function pushAgentLog(session, entry) {
+  const message = typeof entry.message === 'string' ? entry.message.trim() : ''
+  if (!message) {
+    return
+  }
+
+  session.agentLogs.push({
+    timestamp: entry.timestamp || null,
+    phase: entry.phase || 'unknown',
+    source: entry.source || 'agent',
+    message,
+  })
 }
 
 function parseSessionFile(filePath) {
@@ -219,6 +279,7 @@ function parseSessionFile(filePath) {
     }
 
     const timestamp = parseDate(parsed.timestamp)
+    const timestampIso = timestamp ? timestamp.toISOString() : null
     if (timestamp) {
       if (!earliestTimestamp || timestamp < earliestTimestamp) {
         earliestTimestamp = timestamp
@@ -232,6 +293,7 @@ function parseSessionFile(filePath) {
       const payload = parsed.payload ?? {}
       session.sessionId = payload.id || session.sessionId
       session.cwd = payload.cwd || session.cwd
+      session.cliVersion = payload.cli_version || session.cliVersion
       session.modelProvider = payload.model_provider || session.modelProvider
 
       const startedAt = parseDate(payload.timestamp)
@@ -261,11 +323,25 @@ function parseSessionFile(filePath) {
             }
           }
         }
+
+        if (payload.rate_limits) {
+          const rateEventTime = timestamp || latestTimestamp || new Date(0)
+          if (!session.latestRateLimitsAt || rateEventTime > session.latestRateLimitsAt) {
+            session.latestRateLimitsAt = rateEventTime
+            session.latestRateLimits = payload.rate_limits
+          }
+        }
       }
 
       if (payload.type === 'agent_message') {
         session.agentMessages += 1
         incrementCount(session.phaseCounts, payload.phase || 'unknown')
+        pushAgentLog(session, {
+          timestamp: timestampIso,
+          phase: payload.phase || 'commentary',
+          source: 'agent_message',
+          message: payload.message,
+        })
       }
 
       if (payload.type === 'agent_reasoning') {
@@ -279,6 +355,19 @@ function parseSessionFile(filePath) {
       if (payload.type === 'function_call') {
         session.toolCalls += 1
         incrementCount(session.toolCounts, payload.name || 'unknown')
+        continue
+      }
+
+      if (payload.type === 'message' && payload.role === 'assistant' && payload.phase === 'final') {
+        const text = extractAssistantText(payload.content)
+        if (text) {
+          pushAgentLog(session, {
+            timestamp: timestampIso,
+            phase: 'final',
+            source: 'assistant_final',
+            message: text,
+          })
+        }
       }
     }
   }
@@ -312,6 +401,53 @@ function mapToSortedRows(countMap, keyName) {
     })
 }
 
+function buildRateWindow(rateWindow) {
+  if (!rateWindow || typeof rateWindow !== 'object') {
+    return null
+  }
+
+  const usedPercent = clamp(Number(rateWindow.used_percent), 0, 100)
+  const remainingPercent = usedPercent == null ? null : clamp(100 - usedPercent, 0, 100)
+
+  return {
+    usedPercent,
+    remainingPercent,
+    windowMinutes: Number.isFinite(Number(rateWindow.window_minutes)) ? Number(rateWindow.window_minutes) : null,
+    resetsAt: parseUnixSeconds(rateWindow.resets_at)?.toISOString() || null,
+  }
+}
+
+function buildLiveUsage(latestSnapshot) {
+  if (!latestSnapshot || !latestSnapshot.rateLimits) {
+    return {
+      available: false,
+      lastUpdatedAt: null,
+      modelLimitName: null,
+      modelLimitId: null,
+      primary: null,
+      secondary: null,
+      credits: null,
+      planType: null,
+      sessionId: null,
+      cwd: null,
+    }
+  }
+
+  const rateLimits = latestSnapshot.rateLimits
+  return {
+    available: true,
+    lastUpdatedAt: latestSnapshot.timestamp,
+    modelLimitName: rateLimits.limit_name || null,
+    modelLimitId: rateLimits.limit_id || null,
+    primary: buildRateWindow(rateLimits.primary),
+    secondary: buildRateWindow(rateLimits.secondary),
+    credits: rateLimits.credits || null,
+    planType: rateLimits.plan_type || null,
+    sessionId: latestSnapshot.sessionId || null,
+    cwd: latestSnapshot.cwd || null,
+  }
+}
+
 function buildMetrics(sessionsDir, days) {
   const files = collectSessionFiles(sessionsDir)
   const sessions = files.map((filePath) => parseSessionFile(filePath))
@@ -333,6 +469,9 @@ function buildMetrics(sessionsDir, days) {
   const modelUsage = {}
   const phaseUsage = {}
   const projectUsage = {}
+  const feedItems = []
+
+  let latestRateSnapshot = null
 
   for (const session of sessions) {
     totals.inputTokens += session.tokens.input
@@ -354,6 +493,30 @@ function buildMetrics(sessionsDir, days) {
       incrementCount(phaseUsage, phaseName, count)
     }
 
+    if (session.latestRateLimits) {
+      const rateTimestamp = session.latestRateLimitsAt ? session.latestRateLimitsAt.toISOString() : session.endedAt.toISOString()
+      if (!latestRateSnapshot || parseDate(rateTimestamp) > parseDate(latestRateSnapshot.timestamp)) {
+        latestRateSnapshot = {
+          timestamp: rateTimestamp,
+          rateLimits: session.latestRateLimits,
+          sessionId: session.sessionId,
+          cwd: session.cwd || '(unknown cwd)',
+        }
+      }
+    }
+
+    for (const log of session.agentLogs) {
+      feedItems.push({
+        timestamp: log.timestamp || session.startedAt.toISOString(),
+        phase: log.phase || 'unknown',
+        source: log.source || 'agent',
+        message: log.message,
+        sessionId: session.sessionId,
+        model: session.model,
+        cwd: session.cwd || '(unknown cwd)',
+      })
+    }
+
     const projectKey = session.cwd || '(unknown cwd)'
     if (!Object.prototype.hasOwnProperty.call(projectUsage, projectKey)) {
       projectUsage[projectKey] = {
@@ -361,21 +524,31 @@ function buildMetrics(sessionsDir, days) {
         sessions: 0,
         tokens: 0,
         toolCalls: 0,
+        agentMessages: 0,
       }
     }
 
     projectUsage[projectKey].sessions += 1
     projectUsage[projectKey].tokens += session.tokens.total
     projectUsage[projectKey].toolCalls += session.toolCalls
+    projectUsage[projectKey].agentMessages += session.agentMessages
 
     const dayKey = formatDay(session.startedAt)
     if (!perDay.has(dayKey)) {
-      perDay.set(dayKey, { date: dayKey, sessions: 0, tokens: 0 })
+      perDay.set(dayKey, {
+        date: dayKey,
+        sessions: 0,
+        tokens: 0,
+        toolCalls: 0,
+        agentMessages: 0,
+      })
     }
 
     const dayBucket = perDay.get(dayKey)
     dayBucket.sessions += 1
     dayBucket.tokens += session.tokens.total
+    dayBucket.toolCalls += session.toolCalls
+    dayBucket.agentMessages += session.agentMessages
   }
 
   const today = new Date()
@@ -386,8 +559,38 @@ function buildMetrics(sessionsDir, days) {
     const currentDate = new Date(today)
     currentDate.setDate(today.getDate() - offset)
     const key = formatDay(currentDate)
-    daily.push(perDay.get(key) || { date: key, sessions: 0, tokens: 0 })
+    daily.push(
+      perDay.get(key) || {
+        date: key,
+        sessions: 0,
+        tokens: 0,
+        toolCalls: 0,
+        agentMessages: 0,
+      }
+    )
   }
+
+  feedItems.sort((left, right) => {
+    const leftDate = parseDate(left.timestamp)
+    const rightDate = parseDate(right.timestamp)
+    const leftTime = leftDate ? leftDate.getTime() : 0
+    const rightTime = rightDate ? rightDate.getTime() : 0
+    return rightTime - leftTime
+  })
+
+  const latestByPhase = {}
+  for (const item of feedItems) {
+    if (!Object.prototype.hasOwnProperty.call(latestByPhase, item.phase)) {
+      latestByPhase[item.phase] = item
+    }
+  }
+
+  const agentChannels = mapToSortedRows(phaseUsage, 'phase').map((row) => ({
+    phase: row.phase,
+    count: row.count,
+    latestMessage: latestByPhase[row.phase] ? latestByPhase[row.phase].message : '',
+    latestAt: latestByPhase[row.phase] ? latestByPhase[row.phase].timestamp : null,
+  }))
 
   const topProjects = Object.values(projectUsage)
     .sort((left, right) => {
@@ -403,11 +606,14 @@ function buildMetrics(sessionsDir, days) {
     .slice(0, 20)
     .map((session) => ({
       startedAt: session.startedAt.toISOString(),
+      sessionId: session.sessionId,
       model: session.model,
       cwd: session.cwd || '(unknown cwd)',
       tokens: session.tokens.total,
       toolCalls: session.toolCalls,
       agentMessages: session.agentMessages,
+      reasoningEvents: session.reasoningEvents,
+      filePath: session.filePath,
     }))
 
   return {
@@ -417,10 +623,12 @@ function buildMetrics(sessionsDir, days) {
     days,
     totals,
     cacheHitRatio: totals.inputTokens > 0 ? totals.cachedInputTokens / totals.inputTokens : 0,
+    liveUsage: buildLiveUsage(latestRateSnapshot),
+    agentFeed: feedItems.slice(0, 120),
+    agentChannels,
     daily,
     topTools: mapToSortedRows(toolUsage, 'name').slice(0, 15),
     topModels: mapToSortedRows(modelUsage, 'name'),
-    agentPhases: mapToSortedRows(phaseUsage, 'phase'),
     topProjects,
     recentSessions,
   }
@@ -435,9 +643,13 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;')
 }
 
+function escapeWithBreaks(value) {
+  return escapeHtml(value).replace(/\n/g, '<br />')
+}
+
 function shortenPath(value, maxLength = 70) {
-  if (value.length <= maxLength) {
-    return value
+  if (!value || value.length <= maxLength) {
+    return value || ''
   }
   const prefixLength = Math.floor((maxLength - 3) / 2)
   const suffixLength = maxLength - 3 - prefixLength
@@ -472,9 +684,78 @@ function renderTable(rows, columns, emptyMessage) {
   return `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`
 }
 
-function renderDashboard(metrics, autoRefresh) {
+function renderRateWindowCard(title, windowData) {
+  if (!windowData) {
+    return `
+    <article class="usage-card">
+      <div class="usage-title">${escapeHtml(title)}</div>
+      <div class="usage-value">-</div>
+      <div class="usage-sub">No data</div>
+      <div class="usage-progress"><div class="usage-progress-fill" style="width:0%"></div></div>
+    </article>`
+  }
+
+  const remaining = windowData.remainingPercent == null ? 0 : windowData.remainingPercent
+
+  return `
+  <article class="usage-card">
+    <div class="usage-title">${escapeHtml(title)}</div>
+    <div class="usage-value">${escapeHtml(formatPercent(windowData.remainingPercent))}<span class="usage-unit">remaining</span></div>
+    <div class="usage-sub">Used ${escapeHtml(formatPercent(windowData.usedPercent))} | Window ${escapeHtml(windowData.windowMinutes || '-')} min</div>
+    <div class="usage-progress"><div class="usage-progress-fill" style="width:${remaining}%"></div></div>
+    <div class="usage-sub">Resets at ${escapeHtml(formatDateTime(windowData.resetsAt))}</div>
+  </article>`
+}
+
+function renderAgentChannelCards(channels) {
+  if (channels.length === 0) {
+    return '<div class="empty">No agent channel activity yet.</div>'
+  }
+
+  return channels
+    .slice(0, 6)
+    .map(
+      (channel) => `
+      <article class="channel-card">
+        <div class="channel-head">
+          <span class="chip chip-phase">${escapeHtml(channel.phase)}</span>
+          <span class="channel-count">${escapeHtml(formatNumber(channel.count))} msgs</span>
+        </div>
+        <div class="channel-message">${escapeWithBreaks(shortenPath(channel.latestMessage || '', 160))}</div>
+        <div class="channel-time">${escapeHtml(formatDateTime(channel.latestAt))}</div>
+      </article>`
+    )
+    .join('')
+}
+
+function renderMessageFeed(feedItems) {
+  if (feedItems.length === 0) {
+    return '<div class="empty">No agent messages found.</div>'
+  }
+
+  return `
+  <div class="message-feed">
+    ${feedItems
+      .map(
+        (item) => `
+        <article class="message-item">
+          <div class="message-meta">
+            <span class="chip chip-phase">${escapeHtml(item.phase)}</span>
+            <span class="chip chip-source">${escapeHtml(item.source)}</span>
+            <span class="message-time">${escapeHtml(formatDateTime(item.timestamp))}</span>
+          </div>
+          <div class="message-text">${escapeWithBreaks(item.message)}</div>
+          <div class="message-context">${escapeHtml(item.model)} | ${escapeHtml(shortenPath(item.cwd, 78))}</div>
+        </article>`
+      )
+      .join('')}
+  </div>`
+}
+
+function renderDashboard(metrics, options) {
   const tokenBars = renderBarRows(metrics.daily, 'tokens', formatCompact)
   const sessionBars = renderBarRows(metrics.daily, 'sessions', formatNumber)
+  const toolBars = renderBarRows(metrics.daily, 'toolCalls', formatNumber)
 
   const topTools = renderTable(
     metrics.topTools,
@@ -501,126 +782,224 @@ function renderDashboard(metrics, autoRefresh) {
       { header: 'Sessions', render: (row) => formatNumber(row.sessions) },
       { header: 'Tokens', render: (row) => formatNumber(row.tokens) },
       { header: 'Tool Calls', render: (row) => formatNumber(row.toolCalls) },
+      { header: 'Agent Msg', render: (row) => formatNumber(row.agentMessages) },
     ],
     'No project activity detected.'
-  )
-
-  const agentPhases = renderTable(
-    metrics.agentPhases,
-    [
-      { header: 'Phase', render: (row) => row.phase },
-      { header: 'Messages', render: (row) => formatNumber(row.count) },
-    ],
-    'No agent messages detected.'
   )
 
   const recentSessions = renderTable(
     metrics.recentSessions,
     [
-      { header: 'Started', render: (row) => parseDate(row.startedAt)?.toLocaleString() || '-' },
+      { header: 'Started', render: (row) => formatDateTime(row.startedAt) },
       { header: 'Model', render: (row) => row.model },
       { header: 'Tokens', render: (row) => formatNumber(row.tokens) },
       { header: 'Tool Calls', render: (row) => formatNumber(row.toolCalls) },
       { header: 'Agent Msg', render: (row) => formatNumber(row.agentMessages) },
-      { header: 'Project', render: (row) => shortenPath(row.cwd, 55) },
+      { header: 'Project', render: (row) => shortenPath(row.cwd, 48) },
     ],
     'No sessions detected.'
   )
+
+  const usageSummary = metrics.liveUsage
+  const primaryCard = renderRateWindowCard('Primary Window', usageSummary.primary)
+  const secondaryCard = renderRateWindowCard('Secondary Window', usageSummary.secondary)
+  const refreshBadge = options.autoRefresh ? '<span class="pill">Auto refresh 10s</span>' : '<span class="pill">Static snapshot</span>'
 
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Codex Usage Dashboard</title>
+  <title>Codex CLI Usage Visualizer</title>
   <style>
     :root {
-      --bg: #f4f7fb;
+      --bg-0: #edf7ff;
+      --bg-1: #f9fffd;
+      --ink: #0c1425;
+      --muted: #54627d;
+      --line: #d8e1ee;
       --panel: #ffffff;
-      --ink: #0f172a;
-      --muted: #475569;
-      --line: #d7e0ea;
-      --primary: #2563eb;
-      --accent: #0f766e;
+      --brand: #0f6ad9;
+      --brand-2: #16a086;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+      font-family: 'IBM Plex Sans', 'Manrope', 'Segoe UI', sans-serif;
       color: var(--ink);
-      background: radial-gradient(circle at 0% 0%, #e0ecff 0%, transparent 40%), radial-gradient(circle at 100% 0%, #e5fff8 0%, transparent 45%), var(--bg);
+      background: radial-gradient(circle at 0% 0%, #d9ecff 0%, transparent 42%), radial-gradient(circle at 100% 0%, #dbfff2 0%, transparent 45%), linear-gradient(180deg, var(--bg-0), var(--bg-1));
     }
-    .container { max-width: 1280px; margin: 0 auto; padding: 24px; }
-    .header { padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: linear-gradient(120deg, #ffffff 0%, #f5f9ff 45%, #ebfff8 100%); margin-bottom: 18px; }
-    .header h1 { margin: 0; font-size: 30px; letter-spacing: -0.03em; }
-    .meta { margin-top: 10px; color: var(--muted); font-size: 14px; line-height: 1.5; }
-    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); margin-bottom: 16px; }
-    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; min-height: 106px; }
-    .card h2 { margin: 0; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
-    .metric { margin-top: 10px; font-size: 31px; font-weight: 800; letter-spacing: -0.02em; }
-    .split { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); }
-    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 14px; }
-    .panel h3 { margin: 0 0 10px 0; font-size: 18px; }
-    .bar-row { display: grid; grid-template-columns: 100px 1fr 75px; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 13px; }
-    .bar-track { height: 10px; border-radius: 999px; background: #e6edf6; overflow: hidden; }
-    .bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--primary) 0%, var(--accent) 100%); }
+    .container { max-width: 1320px; margin: 0 auto; padding: 20px; }
+    .hero { border: 1px solid var(--line); border-radius: 18px; background: linear-gradient(140deg, #fff 0%, #f2f8ff 50%, #eefff8 100%); padding: 20px; margin-bottom: 14px; }
+    .hero-top { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .hero h1 { margin: 0; font-size: 30px; letter-spacing: -0.03em; }
+    .pill { border: 1px solid #a9ddcf; background: #e9fff8; color: #0d725f; border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 700; }
+    .meta { margin-top: 8px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+    .tabs { display: inline-flex; gap: 4px; border: 1px solid var(--line); border-radius: 999px; background: #fff; padding: 4px; margin: 8px 0 14px; }
+    .tab-btn { border: 0; background: transparent; color: var(--muted); border-radius: 999px; padding: 8px 14px; font-size: 13px; font-weight: 700; cursor: pointer; }
+    .tab-btn.active { color: #fff; background: linear-gradient(90deg, var(--brand), var(--brand-2)); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .panel { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); padding: 14px; margin-bottom: 12px; }
+    .panel h2, .panel h3 { margin: 0 0 10px; letter-spacing: -0.02em; }
+    .mini-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 12px; }
+    .mini-card { border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: #fafcff; }
+    .mini-card-label { color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-size: 11px; font-weight: 700; }
+    .mini-card-value { margin-top: 8px; font-size: 28px; font-weight: 800; letter-spacing: -0.02em; word-break: break-word; }
+    .usage-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); }
+    .usage-card { border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: #fbfeff; }
+    .usage-title { color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: 0.08em; font-weight: 700; }
+    .usage-value { margin-top: 6px; font-size: 26px; font-weight: 800; }
+    .usage-unit { margin-left: 4px; color: var(--muted); font-size: 13px; font-weight: 600; }
+    .usage-sub { margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .usage-progress { margin-top: 8px; height: 10px; border-radius: 999px; background: #e6eef8; overflow: hidden; }
+    .usage-progress-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--brand), var(--brand-2)); }
+    .channel-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+    .channel-card { border: 1px solid var(--line); border-radius: 12px; padding: 10px; min-height: 126px; }
+    .channel-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 8px; }
+    .channel-count { color: var(--muted); font-size: 12px; font-weight: 700; }
+    .channel-message { font-size: 13px; line-height: 1.45; max-height: 65px; overflow: hidden; }
+    .channel-time { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .chip { display: inline-flex; border-radius: 999px; font-size: 11px; font-weight: 700; padding: 2px 8px; border: 1px solid #d0deef; background: #eff5ff; color: #2c4a72; }
+    .chip-source { background: #effcf8; border-color: #c9ebe1; color: #1d6c58; }
+    .message-feed { display: grid; gap: 8px; max-height: 560px; overflow: auto; padding-right: 3px; }
+    .message-item { border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+    .message-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+    .message-time { margin-left: auto; color: var(--muted); font-size: 12px; }
+    .message-text { font-size: 13px; line-height: 1.45; word-break: break-word; }
+    .message-context { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .split { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+    .bar-row { display: grid; grid-template-columns: 100px 1fr 75px; gap: 10px; align-items: center; margin-bottom: 7px; font-size: 13px; }
+    .bar-label { color: var(--muted); }
+    .bar-track { width: 100%; height: 10px; border-radius: 999px; background: #e7eef8; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--brand), var(--brand-2)); }
     .bar-value { text-align: right; font-weight: 700; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; }
-    th { color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px; }
-    .empty { color: var(--muted); padding: 10px 0 4px; }
-    .footnote { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }
+    th { text-transform: uppercase; font-size: 11px; letter-spacing: 0.06em; color: var(--muted); }
+    .empty { color: var(--muted); padding: 8px 0; }
+    .footnote { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    @media (max-width: 900px) {
+      .split { grid-template-columns: 1fr; }
+    }
     @media (max-width: 680px) {
       .container { padding: 14px; }
-      .header h1 { font-size: 24px; }
-      .metric { font-size: 26px; }
-      .bar-row { grid-template-columns: 82px 1fr 62px; }
-      .split { grid-template-columns: 1fr; }
+      .hero { padding: 14px; }
+      .hero h1 { font-size: 24px; }
+      .mini-card-value { font-size: 23px; }
+      .usage-value { font-size: 22px; }
+      .tabs { width: 100%; }
+      .tab-btn { flex: 1 1 50%; }
+      .message-time { margin-left: 0; width: 100%; }
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <section class="header">
-      <h1>Codex Usage Dashboard${autoRefresh ? ' (auto refresh: 10s)' : ''}</h1>
-      <div class="meta">
-        Generated: ${escapeHtml(new Date(metrics.generatedAt).toLocaleString())}<br />
-        Sessions dir: <code>${escapeHtml(metrics.sessionsDir)}</code><br />
-        Scanned files: ${formatNumber(metrics.scannedFiles)}
+    <header class="hero">
+      <div class="hero-top">
+        <h1>Codex CLI Usage Visualizer</h1>
+        ${refreshBadge}
       </div>
+      <div class="meta">
+        Generated: ${escapeHtml(formatDateTime(metrics.generatedAt))}<br />
+        Sessions source: <code>${escapeHtml(metrics.sessionsDir)}</code><br />
+        Scanned files: ${escapeHtml(formatNumber(metrics.scannedFiles))}
+      </div>
+    </header>
+
+    <nav class="tabs" aria-label="dashboard tabs">
+      <button class="tab-btn active" data-tab-btn="live" type="button">Live Overview</button>
+      <button class="tab-btn" data-tab-btn="details" type="button">Detailed Usage</button>
+    </nav>
+
+    <section class="tab-panel active" data-tab-panel="live">
+      <section class="panel">
+        <h2>Real-time Remaining Usage</h2>
+        <div class="mini-grid">
+          <article class="mini-card"><div class="mini-card-label">Last Rate Update</div><div class="mini-card-value">${escapeHtml(formatDateTime(usageSummary.lastUpdatedAt))}</div></article>
+          <article class="mini-card"><div class="mini-card-label">Limit Name</div><div class="mini-card-value">${escapeHtml(usageSummary.modelLimitName || '-')}</div></article>
+          <article class="mini-card"><div class="mini-card-label">Plan Type</div><div class="mini-card-value">${escapeHtml(usageSummary.planType || '-')}</div></article>
+          <article class="mini-card"><div class="mini-card-label">Credits</div><div class="mini-card-value">${escapeHtml(usageSummary.credits && usageSummary.credits.unlimited ? 'Unlimited' : usageSummary.credits && usageSummary.credits.has_credits ? 'Enabled' : 'Unknown')}</div></article>
+        </div>
+        <div class="usage-grid">${primaryCard}${secondaryCard}</div>
+        <div class="footnote">Remaining usage is estimated from the latest <code>rate_limits.used_percent</code> event in Codex session logs.</div>
+      </section>
+
+      <section class="panel">
+        <h3>Agent Channels</h3>
+        <div class="channel-grid">${renderAgentChannelCards(metrics.agentChannels)}</div>
+      </section>
+
+      <section class="panel">
+        <h3>Agent Message Feed</h3>
+        ${renderMessageFeed(metrics.agentFeed)}
+      </section>
     </section>
 
-    <section class="grid">
-      <article class="card"><h2>Total Sessions</h2><div class="metric">${formatNumber(metrics.totals.sessions)}</div></article>
-      <article class="card"><h2>Total Tokens</h2><div class="metric">${formatNumber(metrics.totals.totalTokens)}</div></article>
-      <article class="card"><h2>Tool Calls</h2><div class="metric">${formatNumber(metrics.totals.toolCalls)}</div></article>
-      <article class="card"><h2>Agent Messages</h2><div class="metric">${formatNumber(metrics.totals.agentMessages)}</div></article>
-      <article class="card"><h2>Reasoning Events</h2><div class="metric">${formatNumber(metrics.totals.reasoningEvents)}</div></article>
-      <article class="card"><h2>Cached Input Ratio</h2><div class="metric">${formatPercent(metrics.cacheHitRatio * 100)}</div></article>
-    </section>
+    <section class="tab-panel" data-tab-panel="details">
+      <section class="mini-grid">
+        <article class="mini-card"><div class="mini-card-label">Total Sessions</div><div class="mini-card-value">${escapeHtml(formatNumber(metrics.totals.sessions))}</div></article>
+        <article class="mini-card"><div class="mini-card-label">Total Tokens</div><div class="mini-card-value">${escapeHtml(formatNumber(metrics.totals.totalTokens))}</div></article>
+        <article class="mini-card"><div class="mini-card-label">Tool Calls</div><div class="mini-card-value">${escapeHtml(formatNumber(metrics.totals.toolCalls))}</div></article>
+        <article class="mini-card"><div class="mini-card-label">Agent Messages</div><div class="mini-card-value">${escapeHtml(formatNumber(metrics.totals.agentMessages))}</div></article>
+        <article class="mini-card"><div class="mini-card-label">Reasoning Events</div><div class="mini-card-value">${escapeHtml(formatNumber(metrics.totals.reasoningEvents))}</div></article>
+        <article class="mini-card"><div class="mini-card-label">Cached Input Ratio</div><div class="mini-card-value">${escapeHtml(formatPercent(metrics.cacheHitRatio * 100))}</div></article>
+      </section>
 
-    <section class="split">
-      <article class="panel"><h3>Daily Tokens (Last ${formatNumber(metrics.days)} Days)</h3>${tokenBars}</article>
-      <article class="panel"><h3>Daily Sessions (Last ${formatNumber(metrics.days)} Days)</h3>${sessionBars}</article>
-    </section>
+      <section class="split">
+        <article class="panel"><h3>Daily Tokens (Last ${escapeHtml(formatNumber(metrics.days))} Days)</h3>${tokenBars}</article>
+        <article class="panel"><h3>Daily Sessions (Last ${escapeHtml(formatNumber(metrics.days))} Days)</h3>${sessionBars}</article>
+      </section>
 
-    <section class="split">
-      <article class="panel"><h3>Top Tools</h3>${topTools}</article>
-      <article class="panel"><h3>Model Usage</h3>${topModels}</article>
-    </section>
+      <section class="panel"><h3>Daily Tool Calls (Last ${escapeHtml(formatNumber(metrics.days))} Days)</h3>${toolBars}</section>
 
-    <section class="split">
-      <article class="panel"><h3>Agent Activity by Phase</h3>${agentPhases}</article>
-      <article class="panel"><h3>Top Projects</h3>${topProjects}</article>
-    </section>
+      <section class="split">
+        <article class="panel"><h3>Top Tools</h3>${topTools}</article>
+        <article class="panel"><h3>Model Usage</h3>${topModels}</article>
+      </section>
 
-    <section class="panel">
-      <h3>Recent Sessions</h3>
-      ${recentSessions}
-      <div class="footnote">Agent activity is based on session events: function_call, agent_message, agent_reasoning.</div>
+      <section class="split">
+        <article class="panel"><h3>Top Projects</h3>${topProjects}</article>
+        <article class="panel"><h3>Recent Sessions</h3>${recentSessions}</article>
+      </section>
     </section>
   </div>
-  ${autoRefresh ? '<script>setTimeout(() => location.reload(), 10000);</script>' : ''}
+
+  <script>
+    (function () {
+      const storageKey = 'codex-cli-usage-visualizer:active-tab'
+      const tabButtons = Array.from(document.querySelectorAll('[data-tab-btn]'))
+      const tabPanels = Array.from(document.querySelectorAll('[data-tab-panel]'))
+
+      function activateTab(tabName) {
+        tabButtons.forEach((button) => button.classList.toggle('active', button.dataset.tabBtn === tabName))
+        tabPanels.forEach((panel) => panel.classList.toggle('active', panel.dataset.tabPanel === tabName))
+        try {
+          localStorage.setItem(storageKey, tabName)
+        } catch {
+          // Ignore storage errors
+        }
+      }
+
+      tabButtons.forEach((button) => {
+        button.addEventListener('click', () => activateTab(button.dataset.tabBtn))
+      })
+
+      let initialTab = 'live'
+      try {
+        const savedTab = localStorage.getItem(storageKey)
+        if (savedTab && tabButtons.some((button) => button.dataset.tabBtn === savedTab)) {
+          initialTab = savedTab
+        }
+      } catch {
+        // Ignore storage errors
+      }
+
+      activateTab(initialTab)
+      ${options.autoRefresh ? 'setTimeout(() => window.location.reload(), 10000);' : ''}
+    })()
+  </script>
 </body>
 </html>`
 }
@@ -631,7 +1010,7 @@ function printHelp() {
 
 function writeDashboardFile(options) {
   const metrics = buildMetrics(options.sessionsDir, options.days)
-  const html = renderDashboard(metrics, false)
+  const html = renderDashboard(metrics, { autoRefresh: false })
   fs.writeFileSync(options.output, html, 'utf8')
   process.stdout.write(`Dashboard written: ${options.output}\n`)
 }
@@ -654,13 +1033,14 @@ function startDashboardServer(options) {
     }
 
     const metrics = buildMetrics(options.sessionsDir, options.days)
-    const html = renderDashboard(metrics, true)
+    const html = renderDashboard(metrics, { autoRefresh: true })
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     response.end(html)
   })
 
   server.listen(options.port, () => {
     process.stdout.write(`Codex dashboard running at http://localhost:${options.port}\n`)
+    process.stdout.write('Tip: keep the Live Overview tab open for auto refresh.\n')
   })
 }
 

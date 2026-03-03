@@ -4,11 +4,12 @@ A lightweight local dashboard for visualizing Codex CLI usage and agent activity
 
 ## Features
 
-- Session-level and daily token usage
-- Tool call count trends
-- Agent message and reasoning event counts
-- Model usage distribution
-- Per-project (cwd) usage breakdown
+- `Live Overview` tab
+- Real-time remaining usage cards from latest rate-limit events
+- Agent channel cards and full agent message feed
+- `Detailed Usage` tab
+- Session-level and daily token usage trends
+- Tool call trends, model usage, and project breakdown
 - Recent session activity table
 
 ## Requirements
