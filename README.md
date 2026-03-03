@@ -5,8 +5,9 @@ A lightweight local dashboard for visualizing Codex CLI usage and agent activity
 ## Features
 
 - `Live Overview` tab
-- Real-time remaining usage cards from latest rate-limit events
-- Agent channel cards and full agent message feed
+- Real-time remaining usage cards from latest rate-limit events (1-minute auto refresh)
+- Agent channel cards with `더보기/접기` when channels exceed 3
+- Click a channel card to open a modal with messages for that channel
 - `Detailed Usage` tab
 - Session-level and daily token usage trends
 - Tool call trends, model usage, and project breakdown

@@ -592,6 +592,26 @@ function buildMetrics(sessionsDir, days) {
     latestAt: latestByPhase[row.phase] ? latestByPhase[row.phase].timestamp : null,
   }))
 
+  const agentChannelMessages = {}
+  for (const item of feedItems) {
+    if (!Object.prototype.hasOwnProperty.call(agentChannelMessages, item.phase)) {
+      agentChannelMessages[item.phase] = []
+    }
+
+    if (agentChannelMessages[item.phase].length >= 200) {
+      continue
+    }
+
+    agentChannelMessages[item.phase].push({
+      timestamp: item.timestamp,
+      source: item.source,
+      message: item.message,
+      model: item.model,
+      cwd: item.cwd,
+      sessionId: item.sessionId,
+    })
+  }
+
   const topProjects = Object.values(projectUsage)
     .sort((left, right) => {
       if (right.tokens !== left.tokens) {
@@ -626,6 +646,7 @@ function buildMetrics(sessionsDir, days) {
     liveUsage: buildLiveUsage(latestRateSnapshot),
     agentFeed: feedItems.slice(0, 120),
     agentChannels,
+    agentChannelMessages,
     daily,
     topTools: mapToSortedRows(toolUsage, 'name').slice(0, 15),
     topModels: mapToSortedRows(modelUsage, 'name'),
@@ -645,6 +666,10 @@ function escapeHtml(value) {
 
 function escapeWithBreaks(value) {
   return escapeHtml(value).replace(/\n/g, '<br />')
+}
+
+function safeJsonForScript(value) {
+  return JSON.stringify(value).replace(/</g, '\\u003c')
 }
 
 function shortenPath(value, maxLength = 70) {
@@ -713,16 +738,16 @@ function renderAgentChannelCards(channels) {
   }
 
   return channels
-    .slice(0, 6)
     .map(
-      (channel) => `
-      <article class="channel-card">
+      (channel, index) => `
+      <article class="channel-card${index >= 3 ? ' channel-collapsed' : ''}" data-channel-phase="${escapeHtml(channel.phase)}" role="button" tabindex="0">
         <div class="channel-head">
           <span class="chip chip-phase">${escapeHtml(channel.phase)}</span>
           <span class="channel-count">${escapeHtml(formatNumber(channel.count))} msgs</span>
         </div>
         <div class="channel-message">${escapeWithBreaks(shortenPath(channel.latestMessage || '', 160))}</div>
         <div class="channel-time">${escapeHtml(formatDateTime(channel.latestAt))}</div>
+        <div class="channel-open-hint">Click to open channel messages</div>
       </article>`
     )
     .join('')
@@ -803,7 +828,12 @@ function renderDashboard(metrics, options) {
   const usageSummary = metrics.liveUsage
   const primaryCard = renderRateWindowCard('Primary Window', usageSummary.primary)
   const secondaryCard = renderRateWindowCard('Secondary Window', usageSummary.secondary)
-  const refreshBadge = options.autoRefresh ? '<span class="pill">Auto refresh 10s</span>' : '<span class="pill">Static snapshot</span>'
+  const channelMessagesJson = safeJsonForScript(metrics.agentChannelMessages || {})
+  const hasMoreChannels = metrics.agentChannels.length > 3
+  const channelToggle = hasMoreChannels
+    ? '<div class="channel-tools"><button class="channel-toggle" id="channelToggleBtn" type="button">더보기</button></div>'
+    : ''
+  const refreshBadge = options.autoRefresh ? '<span class="pill">Auto refresh 1m</span>' : '<span class="pill">Static snapshot</span>'
 
   return `<!doctype html>
 <html lang="en">
@@ -855,11 +885,27 @@ function renderDashboard(metrics, options) {
     .usage-progress { margin-top: 8px; height: 10px; border-radius: 999px; background: #e6eef8; overflow: hidden; }
     .usage-progress-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--brand), var(--brand-2)); }
     .channel-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
-    .channel-card { border: 1px solid var(--line); border-radius: 12px; padding: 10px; min-height: 126px; }
+    .channel-card { border: 1px solid var(--line); border-radius: 12px; padding: 10px; min-height: 126px; cursor: pointer; transition: border-color 0.18s ease, transform 0.18s ease; }
+    .channel-card:hover { border-color: #8ab8ff; transform: translateY(-1px); }
+    .channel-card:focus { outline: 2px solid #7fb0ff; outline-offset: 2px; }
+    .channel-collapsed { display: none; }
     .channel-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 8px; }
     .channel-count { color: var(--muted); font-size: 12px; font-weight: 700; }
     .channel-message { font-size: 13px; line-height: 1.45; max-height: 65px; overflow: hidden; }
     .channel-time { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .channel-open-hint { margin-top: 8px; color: #275393; font-size: 12px; font-weight: 700; }
+    .channel-tools { display: flex; justify-content: center; margin-top: 10px; }
+    .channel-toggle {
+      border: 1px solid #b7cce9;
+      background: #f2f8ff;
+      color: #244e8c;
+      border-radius: 999px;
+      padding: 6px 14px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .channel-toggle:hover { background: #e6f1ff; }
     .chip { display: inline-flex; border-radius: 999px; font-size: 11px; font-weight: 700; padding: 2px 8px; border: 1px solid #d0deef; background: #eff5ff; color: #2c4a72; }
     .chip-source { background: #effcf8; border-color: #c9ebe1; color: #1d6c58; }
     .message-feed { display: grid; gap: 8px; max-height: 560px; overflow: auto; padding-right: 3px; }
@@ -879,6 +925,48 @@ function renderDashboard(metrics, options) {
     th { text-transform: uppercase; font-size: 11px; letter-spacing: 0.06em; color: var(--muted); }
     .empty { color: var(--muted); padding: 8px 0; }
     .footnote { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 999;
+      background: rgba(6, 16, 35, 0.62);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+    }
+    .modal-backdrop[hidden] { display: none; }
+    .modal {
+      width: min(860px, 100%);
+      max-height: 84vh;
+      overflow: auto;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+      padding: 14px;
+    }
+    .modal-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .modal-title { margin: 0; font-size: 20px; letter-spacing: -0.02em; }
+    .modal-close {
+      border: 1px solid #c8d4e8;
+      background: #f4f8ff;
+      color: #244b82;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .modal-list { display: grid; gap: 8px; }
+    .modal-item { border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+    .modal-meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .modal-text { font-size: 13px; line-height: 1.45; word-break: break-word; }
     @media (max-width: 900px) {
       .split { grid-template-columns: 1fr; }
     }
@@ -928,7 +1016,8 @@ function renderDashboard(metrics, options) {
 
       <section class="panel">
         <h3>Agent Channels</h3>
-        <div class="channel-grid">${renderAgentChannelCards(metrics.agentChannels)}</div>
+        <div class="channel-grid" id="agentChannelsGrid">${renderAgentChannelCards(metrics.agentChannels)}</div>
+        ${channelToggle}
       </section>
 
       <section class="panel">
@@ -966,11 +1055,98 @@ function renderDashboard(metrics, options) {
     </section>
   </div>
 
+  <div class="modal-backdrop" id="channelModalBackdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="channelModalTitle">
+      <div class="modal-head">
+        <h4 class="modal-title" id="channelModalTitle">Channel</h4>
+        <button class="modal-close" id="channelModalClose" type="button">닫기</button>
+      </div>
+      <div class="modal-list" id="channelModalList"></div>
+    </div>
+  </div>
+
   <script>
     (function () {
       const storageKey = 'codex-cli-usage-visualizer:active-tab'
       const tabButtons = Array.from(document.querySelectorAll('[data-tab-btn]'))
       const tabPanels = Array.from(document.querySelectorAll('[data-tab-panel]'))
+      const channelMessagesByPhase = ${channelMessagesJson}
+      const channelCards = Array.from(document.querySelectorAll('.channel-card'))
+      const channelToggleBtn = document.getElementById('channelToggleBtn')
+      const modalBackdrop = document.getElementById('channelModalBackdrop')
+      const modalTitle = document.getElementById('channelModalTitle')
+      const modalList = document.getElementById('channelModalList')
+      const modalClose = document.getElementById('channelModalClose')
+      let channelsExpanded = false
+
+      function escapeHtmlClient(value) {
+        return String(value)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;')
+      }
+
+      function setChannelExpanded(expanded) {
+        channelsExpanded = expanded
+        channelCards.forEach((card, index) => {
+          if (index < 3) {
+            return
+          }
+          card.classList.toggle('channel-collapsed', !expanded)
+        })
+
+        if (channelToggleBtn) {
+          channelToggleBtn.textContent = expanded ? '접기' : '더보기'
+        }
+      }
+
+      function renderModalMessages(phase) {
+        const messages = channelMessagesByPhase[phase] || []
+        if (!messages.length) {
+          return '<div class="empty">No messages in this channel.</div>'
+        }
+
+        return messages
+          .map((message) => {
+            const timeLabel = message.timestamp ? new Date(message.timestamp).toLocaleString() : '-'
+            return (
+              '<article class="modal-item">' +
+              '<div class="modal-meta">' +
+              escapeHtmlClient(timeLabel) +
+              ' | ' +
+              escapeHtmlClient(message.source || 'agent') +
+              ' | ' +
+              escapeHtmlClient(message.model || '-') +
+              '</div>' +
+              '<div class="modal-text">' +
+              escapeHtmlClient(message.message || '').replace(/\\n/g, '<br />') +
+              '</div>' +
+              '<div class="modal-meta">' +
+              escapeHtmlClient(message.cwd || '-') +
+              '</div>' +
+              '</article>'
+            )
+          })
+          .join('')
+      }
+
+      function openChannelModal(phase) {
+        if (!modalBackdrop || !modalTitle || !modalList) {
+          return
+        }
+        modalTitle.textContent = phase + ' channel'
+        modalList.innerHTML = renderModalMessages(phase)
+        modalBackdrop.hidden = false
+      }
+
+      function closeChannelModal() {
+        if (!modalBackdrop) {
+          return
+        }
+        modalBackdrop.hidden = true
+      }
 
       function activateTab(tabName) {
         tabButtons.forEach((button) => button.classList.toggle('active', button.dataset.tabBtn === tabName))
@@ -986,6 +1162,45 @@ function renderDashboard(metrics, options) {
         button.addEventListener('click', () => activateTab(button.dataset.tabBtn))
       })
 
+      if (channelToggleBtn) {
+        channelToggleBtn.addEventListener('click', () => {
+          setChannelExpanded(!channelsExpanded)
+        })
+      }
+
+      channelCards.forEach((card) => {
+        const phase = card.dataset.channelPhase
+        if (!phase) {
+          return
+        }
+
+        card.addEventListener('click', () => openChannelModal(phase))
+        card.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            openChannelModal(phase)
+          }
+        })
+      })
+
+      if (modalClose) {
+        modalClose.addEventListener('click', closeChannelModal)
+      }
+
+      if (modalBackdrop) {
+        modalBackdrop.addEventListener('click', (event) => {
+          if (event.target === modalBackdrop) {
+            closeChannelModal()
+          }
+        })
+      }
+
+      window.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          closeChannelModal()
+        }
+      })
+
       let initialTab = 'live'
       try {
         const savedTab = localStorage.getItem(storageKey)
@@ -996,8 +1211,9 @@ function renderDashboard(metrics, options) {
         // Ignore storage errors
       }
 
+      setChannelExpanded(false)
       activateTab(initialTab)
-      ${options.autoRefresh ? 'setTimeout(() => window.location.reload(), 10000);' : ''}
+      ${options.autoRefresh ? 'setTimeout(() => window.location.reload(), 60000);' : ''}
     })()
   </script>
 </body>
@@ -1040,7 +1256,7 @@ function startDashboardServer(options) {
 
   server.listen(options.port, () => {
     process.stdout.write(`Codex dashboard running at http://localhost:${options.port}\n`)
-    process.stdout.write('Tip: keep the Live Overview tab open for auto refresh.\n')
+    process.stdout.write('Tip: keep the Live Overview tab open for 1-minute auto refresh.\n')
   })
 }
 
